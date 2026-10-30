@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   probe:
-    if: github.event.head_commit.message == 'Probe pending without payer identity once'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
