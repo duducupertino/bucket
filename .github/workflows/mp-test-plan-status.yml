@@ -1,13 +1,14 @@
 name: Inspect TEST plan checkout status once
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 permissions: {}
 concurrency:
   group: rm2-sandbox-pending-identifier
   cancel-in-progress: false
 jobs:
   probe:
-    if: ${{ false }}
+    if: github.event.head_commit.message == 'Verify completed TEST checkout 20261030T1445'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
