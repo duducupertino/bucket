@@ -1,0 +1,279 @@
+name: Mercado Pago pending identifier experiment
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mp-pending-identifier-experiment.yml']
+permissions: {}
+concurrency:
+  group: rm2-sandbox-pending-identifier
+  cancel-in-progress: false
+jobs:
+  pending-experiment:
+    if: github.event.head_commit.message == 'Run pending identifier probe once 20261030T1306'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pending test identifier and cleanup without payment
+        env:
+          MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
+          MP_TEST_BUYER_JSON: '{"identifier":"TESTUSER7604974922275426030","id":3805193692}'
+          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-pending-private-journal.json
+          RM2_PROBE_MODE: create
+          RM2_PENDING_EXECUTION_APPROVED: 'yes'
+          RM2_WEBHOOK_ROUTING_REVIEWED: 'yes'
+          RM2_RECOVERY_PLAN_REVIEWED: 'yes'
+          RM2_ISOLATED_BACK_URL: https://example.com/futurorm2-sandbox-return
+          RM2_ISOLATED_CALLBACK_HOST: example.com
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          """Explicitly gated pending-only TEST experiment. Never prints provider bodies."""
+          import json
+          import os
+          import re
+          import sys
+          import tempfile
+          import uuid
+          from decimal import Decimal, InvalidOperation
+          from pathlib import Path
+          from urllib.error import HTTPError
+          from urllib.parse import parse_qs, urlencode, urlsplit
+          from urllib.request import Request, build_opener, HTTPRedirectHandler
+          
+          class Stop(Exception):
+              pass
+          
+          def need(ok, code):
+              if not ok:
+                  raise Stop(code)
+          
+          def ident(value):
+              need(type(value) in (str, int) and not isinstance(value, bool), 'invalid_id')
+              value = str(value)
+              need(bool(re.fullmatch(r'[A-Za-z0-9_-]{1,100}', value)), 'invalid_id')
+              return value
+          
+          def ref_for(run):
+              need(isinstance(run, str) and bool(re.fullmatch(r'[1-9][0-9]{0,24}', run)), 'invalid_run')
+              return str(uuid.uuid5(uuid.NAMESPACE_URL, 'rm2-sandbox-pending:' + run))
+          
+          def buyer_config(raw):
+              try:
+                  value = json.loads(raw)
+              except Exception:
+                  raise Stop('invalid_buyer_config') from None
+              need(type(value) is dict and set(value) == {'identifier', 'id'}, 'invalid_buyer_config')
+              need(type(value['identifier']) is str and bool(re.fullmatch(r'TESTUSER[0-9]{1,40}', value['identifier'])), 'invalid_test_identifier')
+              bid = ident(value['id'])
+              need(bid.isdigit() and int(bid) > 0, 'invalid_buyer_id')
+              return value['identifier'], bid
+          
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  raise Stop('redirect_refused')
+          
+          class Client:
+              def __init__(self, token):
+                  need(type(token) is str and len(token) > 10 and '\n' not in token and '\r' not in token, 'missing_token')
+                  self.token = token
+                  self.opener = build_opener(NoRedirect())
+              def call(self, method, path, body=None, key=None):
+                  parts = urlsplit(path)
+                  need(not parts.scheme and not parts.netloc and not parts.fragment, 'invalid_route')
+                  resource = bool(re.fullmatch(r'/preapproval/[A-Za-z0-9_-]{1,100}', parts.path)) and parts.path != '/preapproval/search'
+                  q = parse_qs(parts.query, keep_blank_values=True)
+                  search = parts.path == '/preapproval/search' and set(q) in ({'payer_id','limit','offset'}, {'limit','offset'}) and all(len(v)==1 for v in q.values()) and q.get('payer_id',['0'])[0].isdigit() and q['limit']==['100'] and q['offset'][0].isdigit()
+                  allowed = (method == 'GET' and body is None and key is None and ((path == '/users/me') or (resource and not parts.query) or search)) or (method == 'POST' and path == '/preapproval' and type(body) is dict and type(key) is str) or (method == 'PUT' and resource and not parts.query and body == {'status':'cancelled'} and key is None)
+                  need(allowed, 'route_refused')
+                  headers = {'Authorization':'Bearer '+self.token, 'Content-Type':'application/json'}
+                  if key:
+                      headers['X-Idempotency-Key'] = key
+                  data = None if body is None else json.dumps(body).encode()
+                  try:
+                      with self.opener.open(Request('https://api.mercadopago.com'+path, data=data, headers=headers, method=method), timeout=25) as res:
+                          need(res.status in ((200,201) if method=='POST' else (200,)), 'unexpected_http_status')
+                          raw = res.read(1_000_001)
+                          need(len(raw) <= 1_000_000, 'response_too_large')
+                  except HTTPError as exc:
+                      raise Stop('http_' + str(exc.code)) from None
+                  except Stop:
+                      raise
+                  except Exception:
+                      raise Stop('transport_outcome_uncertain') from None
+                  try:
+                      value = json.loads(raw)
+                  except Exception:
+                      raise Stop('invalid_response_json') from None
+                  need(type(value) is dict, 'invalid_response_object')
+                  return value
+          
+          def seller(client):
+              me = client.call('GET','/users/me')
+              need(me.get('site_id') == 'MLB' and type(me.get('tags')) is list and all(type(t) is str for t in me['tags']) and 'test_user' in me['tags'], 'seller_not_verified_test_mlb')
+              return ident(me.get('id'))
+          
+          def callback(url, expected_host):
+              p = urlsplit(url)
+              host = p.hostname or ''
+              need(len(host)<=253 and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in host.split('.')), 'noncanonical_callback_host')
+              need(p.scheme == 'https' and p.netloc == host and host == expected_host and host == host.lower() and not host.endswith('.') and '.' in host and not p.fragment and not p.query, 'invalid_callback')
+              need(host != 'futurorm2.com' and not host.endswith('.futurorm2.com'), 'production_callback_refused')
+              return url
+          
+          def owned(row, sid, ref, rid):
+              need(type(row) is dict and ident(row.get('id')) == rid and ident(row.get('collector_id')) == sid and row.get('external_reference') == ref, 'ownership_or_reference_mismatch')
+          
+          def offer(row, rid, bid):
+              need(ident(row.get('payer_id')) == bid, 'resolved_buyer_mismatch')
+              need(row.get('status') == 'pending', 'not_pending')
+              rec = row.get('auto_recurring')
+              need(type(rec) is dict and type(rec.get('frequency')) is int and rec['frequency']==1 and rec.get('frequency_type')=='months' and rec.get('currency_id')=='BRL', 'offer_mismatch')
+              try:
+                  amount = Decimal(str(rec.get('transaction_amount')))
+              except InvalidOperation:
+                  raise Stop('offer_mismatch') from None
+              need(amount.is_finite() and amount == Decimal('9.90'), 'offer_mismatch')
+              need(not any(rec.get(k) is not None for k in ('free_trial','repetitions','end_date','billing_day','billing_day_proportional')), 'offer_extras')
+              need(type(row.get('init_point')) is str, 'checkout_shape_mismatch')
+              try:
+                  p = urlsplit(row['init_point'])
+              except (ValueError, TypeError, AttributeError):
+                  raise Stop('checkout_shape_mismatch') from None
+              q = parse_qs(p.query, keep_blank_values=True)
+              need(p.scheme=='https' and p.netloc=='www.mercadopago.com.br' and p.path=='/subscriptions/checkout' and not p.fragment and set(q) in ({'preapproval_id'}, {'preapproval_id','activation'}) and q.get('preapproval_id')==[rid] and q.get('activation',['true'])==['true'], 'checkout_shape_mismatch')
+          
+          class Journal:
+              def __init__(self, path):
+                  self.path = Path(path)
+                  root = Path(os.environ.get('RUNNER_TEMP','/tmp')).resolve()
+                  need(self.path.is_absolute(), 'invalid_journal')
+                  need(self.path.parent.resolve() == root or root in self.path.parent.resolve().parents, 'invalid_journal')
+                  need(not self.path.exists() and not self.path.is_symlink(), 'journal_exists')
+                  try:
+                      fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                      os.close(fd)
+                  except Exception:
+                      raise Stop('journal_reservation_failed') from None
+              def write(self, **fields):
+                  fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix='.pending-')
+                  try:
+                      with os.fdopen(fd,'w') as out:
+                          json.dump(fields,out); out.flush(); os.fsync(out.fileno())
+                      os.replace(tmp,self.path)
+                  finally:
+                      if os.path.exists(tmp): os.unlink(tmp)
+          
+          def clean(client, row, sid, ref, rid, journal):
+              owned(row,sid,ref,rid)
+              if row.get('status') == 'cancelled':
+                  journal.write(phase='cancelled_verified', reference=ref, id=rid)
+                  return
+              # Cleanup cannot touch an unexpectedly authorized/paid contract.
+              need(row.get('status') == 'pending', 'cleanup_requires_pending')
+              journal.write(phase='cancellation_outcome_pending', reference=ref, id=rid)
+              client.call('PUT','/preapproval/'+rid, {'status':'cancelled'})
+              after = client.call('GET','/preapproval/'+rid)
+              owned(after,sid,ref,rid)
+              need(after.get('status')=='cancelled', 'cancellation_not_verified')
+              journal.write(phase='cancelled_verified', reference=ref, id=rid)
+          
+          def create(client, run, identifier, bid, back_url, journal):
+              ref = ref_for(run)
+              sid = seller(client)
+              need(sid != bid, 'same_buyer_seller')
+              body = {'status':'pending', 'reason':'FuturoRM2 — concurso RM2 da Marinha', 'external_reference':ref, 'payer_email':identifier, 'auto_recurring':{'frequency':1,'frequency_type':'months','transaction_amount':9.9,'currency_id':'BRL'}, 'back_url':back_url}
+              journal.write(phase='creation_outcome_pending', original_run=run, reference=ref)
+              response = client.call('POST','/preapproval',body,ref)
+              rid = ident(response.get('id'))
+              journal.write(phase='created_id_received', original_run=run, reference=ref, id=rid)
+              row = client.call('GET','/preapproval/'+rid)
+              owned(row,sid,ref,rid)
+              failure = None
+              try:
+                  offer(row,rid,bid)
+              except Stop as exc:
+                  failure = str(exc)
+              clean(client,row,sid,ref,rid,journal)
+              if failure:
+                  raise Stop(failure+'_cleaned')
+              return {'pending_identifier_resolved':True, 'read_verified':True, 'cancelled_verified':True, 'payment_attempted':False, 'hosted_checkout_opened':False}
+          
+          def search_reference(client, ref, bid=None):
+              matches = {}
+              seen = set()
+              offset = 0
+              total = None
+              for _ in range(100):
+                  query = {'limit':100, 'offset':offset}
+                  if bid is not None:
+                      query['payer_id'] = bid
+                  data = client.call('GET','/preapproval/search?'+urlencode(query))
+                  rows, paging = data.get('results'), data.get('paging')
+                  need(type(rows) is list and type(paging) is dict, 'invalid_search_page')
+                  need(all(type(paging.get(k)) is int for k in ('total','offset','limit')), 'invalid_search_paging')
+                  current_total = paging['total']
+                  need(0<=current_total<=10000 and paging['offset']==offset and paging['limit']==100, 'invalid_search_paging')
+                  need(total is None or total==current_total, 'search_changed_retry_read_only')
+                  total = current_total
+                  need(offset<=total and len(rows)==min(100,total-offset), 'incomplete_search')
+                  for row in rows:
+                      need(type(row) is dict, 'invalid_search_row')
+                      rid = ident(row.get('id'))
+                      need(rid not in seen, 'duplicate_search_row')
+                      seen.add(rid)
+                      if row.get('external_reference')==ref:
+                          matches[rid] = True
+                  need(len(matches)<=1, 'multiple_matches_no_mutation')
+                  offset += len(rows)
+                  if offset==total:
+                      return matches
+              raise Stop('search_limit_no_mutation')
+          
+          def recover(client, original_run, bid, journal):
+              ref = ref_for(original_run)
+              sid = seller(client)
+              need(sid != bid, 'same_buyer_seller')
+              # Account-wide TEST-only scan intentionally detects wrong-payer resolutions
+              # and duplicate references; no unrelated row is logged or changed.
+              matches = search_reference(client,ref)
+              need(len(matches)==1, 'no_match_inconclusive_never_repost')
+              rid = next(iter(matches))
+              row = client.call('GET','/preapproval/'+rid)
+              owned(row,sid,ref,rid)
+              try:
+                  payer_matches = ident(row.get('payer_id')) == bid
+              except Stop:
+                  payer_matches = False
+              clean(client,row,sid,ref,rid,journal)
+              if not payer_matches:
+                  raise Stop('recovery_buyer_mismatch_cleaned')
+              return {'recovery_cancelled_verified':True, 'payment_attempted':False, 'hosted_checkout_opened':False}
+          
+          def main():
+              need(os.environ.get('RM2_PENDING_EXECUTION_APPROVED')=='yes', 'execution_not_approved')
+              need(os.environ.get('RM2_WEBHOOK_ROUTING_REVIEWED')=='yes', 'routing_not_reviewed')
+              identifier,bid = buyer_config(os.environ.get('MP_TEST_BUYER_JSON',''))
+              mode = os.environ.get('RM2_PROBE_MODE','')
+              need(mode in ('create','recover'), 'invalid_mode')
+              run = os.environ.get('GITHUB_RUN_ID','') if mode=='create' else os.environ.get('RM2_ORIGINAL_RUN_ID','')
+              ref_for(run)
+              if mode=='create':
+                  need(os.environ.get('GITHUB_RUN_ATTEMPT')=='1', 'rerun_refused_use_recovery')
+                  need(os.environ.get('RM2_RECOVERY_PLAN_REVIEWED')=='yes', 'recovery_not_reviewed')
+              client = Client(os.environ.get('MP_ACCESS_TOKEN',''))
+              journal = Journal(os.environ.get('RM2_PRIVATE_JOURNAL',''))
+              if mode=='create':
+                  back = callback(os.environ.get('RM2_ISOLATED_BACK_URL',''), os.environ.get('RM2_ISOLATED_CALLBACK_HOST',''))
+                  result = create(client,run,identifier,bid,back,journal)
+              else:
+                  result = recover(client,run,bid,journal)
+              print(json.dumps(result))
+          
+          if __name__=='__main__':
+              try:
+                  main()
+              except Stop as exc:
+                  print(json.dumps({'ok':False,'code':str(exc)})); sys.exit(1)
+              except BaseException:
+                  print(json.dumps({'ok':False,'code':'unexpected_failure_outcome_requires_review'})); sys.exit(1)
+          PYCODE
