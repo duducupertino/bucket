@@ -2,15 +2,11 @@ name: Mercado Pago sandbox connectivity
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/mp-sandbox-connectivity.yml']
 
 permissions: {}
 
 jobs:
   catalog-connectivity:
-    if: github.event_name == 'workflow_dispatch' || github.event.head_commit.message == 'Run one-time sandbox connectivity 20261030T1049'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
