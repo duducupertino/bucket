@@ -1,14 +1,13 @@
 name: Capture approved TEST subscription for offline replay once
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 permissions: {}
 concurrency:
   group: rm2-sandbox-pending-identifier
   cancel-in-progress: false
 jobs:
   probe:
-    if: github.event.head_commit.message == 'Capture approved TEST subscription for offline replay once'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
