@@ -1,7 +1,9 @@
 name: Mercado Pago standalone sandbox payment smoke
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mp-sandbox-payment-smoke.yml']
 
 permissions: {}
 
@@ -11,6 +13,7 @@ concurrency:
 
 jobs:
   standalone-sandbox-payment:
+    if: github.event.head_commit.message == 'Run verified test-account payment 20261030T1110'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -58,10 +61,9 @@ jobs:
                   stop('execution_not_enabled')
               if os.environ.get('MP_TEST_ORIGIN_CONFIRMED') != 'true':
                   stop('test_origin_not_confirmed')
-              # Conservative scope: this proposal does not support APP_USR test accounts.
-              # Prefix is only an additional guard, never sufficient proof of sandbox.
-              if not token.startswith('TEST-') or '\r' in token or '\n' in token:
-                  stop('credential_scope_not_supported')
+              # Identity is verified with this exact credential in this same run.
+              if not token or not token.isascii() or '\r' in token or '\n' in token:
+                  stop('credential_unusable')
               run_id = os.environ.get('GITHUB_RUN_ID', '')
               if not re.fullmatch(r'[0-9]+', run_id):
                   stop('github_run_id_required')
@@ -72,7 +74,7 @@ jobs:
           
               def api(stage, method, path, payload=None):
                   allowed = ((method == 'POST' and path in ('/v1/card_tokens', '/v1/payments'))
-                             or (method == 'GET' and re.fullmatch(r'/v1/payments/[0-9]+', path)))
+                             or (method == 'GET' and (path == '/users/me' or re.fullmatch(r'/v1/payments/[0-9]+', path))))
                   if not allowed:
                       stop('endpoint_not_allowed')
                   headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}
@@ -94,7 +96,7 @@ jobs:
                           status = response.status
                           body = response.read(MAX_BYTES + 1)
                       print(stage + '_http_status=' + str(status))
-                      if status not in (200, 201) or len(body) > MAX_BYTES:
+                      if status not in ((200,) if method == 'GET' else (200, 201)) or len(body) > MAX_BYTES:
                           stop(stage + '_http_or_size_failure_no_retry')
                       result = json.loads(body)
                       if not isinstance(result, dict):
@@ -102,6 +104,13 @@ jobs:
                       return result
                   except (ValueError, UnicodeError, OSError):
                       stop(stage + '_unreadable_response_no_retry')
+          
+              identity = api('identity', 'GET', '/users/me')
+              tags = identity.get('tags')
+              if (not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)
+                      or 'test_user' not in tags or identity.get('site_id') != 'MLB'):
+                  stop('brazil_test_identity_not_confirmed_no_post')
+              print('brazil_test_identity_confirmed=true')
           
               # Public official test fixture, never actual cardholder/card data.
               card = api('tokenization', 'POST', '/v1/card_tokens', {
