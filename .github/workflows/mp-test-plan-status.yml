@@ -1,0 +1,291 @@
+name: Inspect TEST plan checkout status once
+on:
+  push:
+    branches: [main]
+permissions: {}
+concurrency:
+  group: rm2-sandbox-pending-identifier
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.event.head_commit.message == 'Inspect TEST plan checkout status once'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read exact TEST plan and correlated test subscriptions only
+        env:
+          MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
+          RM2_PLAN_STATUS_READ_APPROVED: 'yes'
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          
+          import os
+          
+          import re
+          
+          import sys
+          
+          import tempfile
+          
+          import uuid
+          
+          from decimal import Decimal, InvalidOperation
+          
+          from pathlib import Path
+          
+          from urllib.error import HTTPError
+          
+          from urllib.parse import parse_qs, urlencode, urlsplit
+          
+          from urllib.request import Request, build_opener, HTTPRedirectHandler
+          
+          class Stop(Exception):
+              pass
+          
+          class HTTPFailure(Stop):
+              def __init__(self, status, detail):
+                  super().__init__('http_' + str(status))
+                  self.detail = detail
+          
+          def safe_http_detail(raw, method, path, secrets):
+              route = path.split('?')[0]
+              if re.fullmatch(r'/(?:preapproval_plan|preapproval|v1/payments)/[A-Za-z0-9_-]{1,100}',route) and not route.endswith('/search'):
+                  route = route.rsplit('/',1)[0]+'/{id}'
+              detail = {'method':method, 'route':route}
+              def scrub(value):
+                  if type(value) not in (str, int):
+                      return None
+                  value = str(value)[:4000]
+                  for secret in secrets:
+                      if secret:
+                          value = value.replace(str(secret), '[redacted]')
+                  value = re.sub(r'(?i)https?://[^\s\"<>]+', '[url]', value)
+                  value = re.sub(r"[^\s\"<>]+@[A-Za-z0-9.-]+", '[email]', value)
+                  value = re.sub(r'(?i)\b(?:APP_USR|TESTUSER|TEST-)[A-Za-z0-9_-]*', '[redacted]', value)
+                  value = re.sub(r'\b[0-9]{6,}\b', '[id]', value)
+                  value = re.sub(r'(?i)\b[0-9a-f]{24,}\b', '[opaque_id]', value)
+                  value = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b', '[reference]', value)
+                  return ''.join(c for c in value if c.isprintable())[:500]
+              try:
+                  data = json.loads(raw)
+              except Exception:
+                  detail['category'] = 'non_json_error_response'
+                  return detail
+              if type(data) is not dict:
+                  detail['category'] = 'non_object_error_response'
+                  return detail
+              detail['category'] = 'provider_error'
+              known_messages = {
+                  'Invalid payer_email', 'Invalid value for payer_email',
+                  'payer_email must be a valid email', 'The payer_email must be a valid email',
+                  'Invalid email', 'Invalid email address',
+                  'Unauthorized use of live credentials', 'Invalid credentials',
+                  'Invalid access token', 'Invalid back_url', 'Invalid value for back_url',
+                  'The payer and collector cannot be the same',
+                  'Cannot operate between different countries',
+              }
+              message = data.get('message')
+              if type(message) is str:
+                  known = {v.casefold():v for v in known_messages}
+                  if message.strip().casefold() in known:
+                      detail['message'] = known[message.strip().casefold()]
+                  else:
+                      lower = message.casefold()
+                      detail['message_category'] = 'unrecognized_provider_message_not_logged'
+                      detail['mentioned_fields'] = [v for v in ('payer_email','payer_id','back_url','auto_recurring','external_reference','access_token','status','currency_id','transaction_amount') if v in lower]
+                      detail['reason_signals'] = [v for v in ('invalid','required','unauthorized','forbidden','not found','not allowed','email','credentials') if v in lower]
+              error = data.get('error')
+              known_errors = {'bad_request','unauthorized','forbidden','not_found','invalid_request','invalid_token','invalid_grant','invalid_payer_email','validation_error'}
+              if type(error) is str and error in known_errors:
+                  detail['error'] = error
+              elif error is not None:
+                  detail['error_category'] = 'unrecognized_code_not_logged'
+              causes = data.get('cause')
+              if type(causes) is list:
+                  codes=[]
+                  for cause in causes[:10]:
+                      if type(cause) is not dict:
+                          continue
+                      code=cause.get('code')
+                      if type(code) in (str,int) and re.fullmatch(r'[0-9]{1,5}',str(code)):
+                          codes.append(str(code))
+                      elif type(code) is str and code in known_errors:
+                          codes.append(code)
+                      else:
+                          codes.append('unknown_code_not_logged')
+                  detail['cause_codes']=codes
+              return detail
+          
+          def need(ok, code):
+              if not ok:
+                  raise Stop(code)
+          
+          def ident(value):
+              need(type(value) in (str, int) and not isinstance(value, bool), 'invalid_id')
+              value = str(value)
+              need(bool(re.fullmatch(r'[A-Za-z0-9_-]{1,100}', value)), 'invalid_id')
+              return value
+          
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  raise Stop('redirect_refused')
+          
+          class Client:
+              def __init__(self, token):
+                  need(type(token) is str and len(token) > 10 and '\n' not in token and '\r' not in token, 'missing_token')
+                  self.token = token
+                  self.sensitive = [token]
+                  try:
+                      buyer = json.loads(os.environ.get('MP_TEST_BUYER_JSON','{}'))
+                      self.sensitive.extend(str(buyer.get(k,'')) for k in ('identifier','id'))
+                  except Exception:
+                      pass
+                  self.opener = build_opener(NoRedirect())
+              def call(self, method, path, body=None, key=None):
+                  parts = urlsplit(path)
+                  need(not parts.scheme and not parts.netloc and not parts.fragment, 'invalid_route')
+                  resource = bool(re.fullmatch(r'/(?:preapproval_plan|preapproval|v1/payments)/[A-Za-z0-9_-]{1,100}', parts.path)) and not parts.path.endswith('/search')
+                  q = parse_qs(parts.query,keep_blank_values=True)
+                  singleton = all(len(v)==1 for v in q.values())
+                  search = (parts.path=='/preapproval/search' and set(q)=={'preapproval_plan_id','limit','offset'} and q.get('preapproval_plan_id')==[PLAN_ID] and q.get('limit')==['100'] and q.get('offset',[''])[0].isdigit()) or (parts.path=='/authorized_payments/search' and set(q)=={'preapproval_id','offset'} and bool(re.fullmatch(r'[A-Za-z0-9_-]{1,100}',q.get('preapproval_id',[''])[0])) and q.get('offset',[''])[0].isdigit())
+                  allowed = method=='GET' and body is None and key is None and (path=='/users/me' or resource and not parts.query or search and singleton)
+                  need(allowed, 'route_refused')
+                  headers = {'Authorization':'Bearer '+self.token, 'Content-Type':'application/json'}
+                  if key:
+                      headers['X-Idempotency-Key'] = key
+                  data = None if body is None else json.dumps(body).encode()
+                  try:
+                      with self.opener.open(Request('https://api.mercadopago.com'+path, data=data, headers=headers, method=method), timeout=25) as res:
+                          need(res.status in ((200,201) if method=='POST' else (200,)), 'unexpected_http_status')
+                          raw = res.read(1_000_001)
+                          need(len(raw) <= 1_000_000, 'response_too_large')
+                  except HTTPError as exc:
+                      try:
+                          raw = exc.read(16384)
+                      except Exception:
+                          raw = b''
+                      sensitive = list(self.sensitive)
+                      if resource:
+                          sensitive.append(parts.path.rsplit('/',1)[-1])
+                      if type(body) is dict:
+                          sensitive.extend(str(body.get(k,'')) for k in ('external_reference','payer_email'))
+                      if key:
+                          sensitive.append(key)
+                      raise HTTPFailure(exc.code, safe_http_detail(raw,method,path,sensitive)) from None
+                  except Stop:
+                      raise
+                  except Exception:
+                      raise Stop('transport_outcome_uncertain') from None
+                  try:
+                      value = json.loads(raw)
+                  except Exception:
+                      raise Stop('invalid_response_json') from None
+                  need(type(value) is dict, 'invalid_response_object')
+                  return value
+          
+          def seller(client):
+              me = client.call('GET','/users/me')
+              need(me.get('site_id') == 'MLB' and type(me.get('tags')) is list and all(type(t) is str for t in me['tags']) and 'test_user' in me['tags'], 'seller_not_verified_test_mlb')
+              sid = ident(me.get('id'))
+              if type(getattr(client, "sensitive", None)) is list:
+                  client.sensitive.append(sid)
+              return sid
+          
+          def reason_for(run):
+              need(type(run) is str and bool(re.fullmatch(r'[1-9][0-9]{0,24}',run)), 'invalid_original_run')
+              return 'Futuro RM2 TEST '+str(uuid.uuid5(uuid.NAMESPACE_URL,'rm2-sandbox-plan:'+run))
+          
+          def owned_plan(row,sid,reason,rid):
+              need(type(row) is dict and ident(row.get('id'))==rid and ident(row.get('collector_id'))==sid and row.get('reason')==reason, 'plan_owner_or_reason_mismatch')
+          
+          def plan_link(row,rid):
+              need(row.get('status')=='active', 'plan_not_active')
+              recurring=row.get('auto_recurring')
+              need(type(recurring) is dict and type(recurring.get('frequency')) is int and recurring['frequency']==1 and recurring.get('frequency_type')=='months' and type(recurring.get('repetitions')) is int and recurring['repetitions']==1 and recurring.get('currency_id')=='BRL', 'plan_offer_mismatch')
+              try:amount=Decimal(str(recurring.get('transaction_amount')))
+              except InvalidOperation:raise Stop('plan_offer_mismatch') from None
+              need(amount.is_finite() and amount==Decimal('9.90'), 'plan_offer_mismatch')
+              need(not any(recurring.get(k) for k in ('free_trial','billing_day','billing_day_proportional','end_date')), 'plan_offer_extra_terms')
+              value=row.get('init_point')
+              need(type(value) is str, 'invalid_plan_checkout')
+              try:url=urlsplit(value)
+              except ValueError:raise Stop('invalid_plan_checkout') from None
+              need(url.scheme=='https' and url.netloc=='www.mercadopago.com.br' and url.path=='/subscriptions/checkout' and not url.fragment and parse_qs(url.query,keep_blank_values=True)=={'preapproval_plan_id':[rid]}, 'invalid_plan_checkout')
+              return value
+          
+          PLAN_ID='0a8daf33ffbc465889c21aa5ad710eae'
+          PLAN_RUN='41069209571'
+          BUYER_ID='3805193692'
+          
+          def list_rows(client,path,filters,max_rows=1000):
+              offset=0;total=None;seen=set();all_rows=[]
+              for _ in range(100):
+                  data=client.call('GET',path+'?'+urlencode({**filters,'offset':offset}))
+                  rows,paging=data.get('results'),data.get('paging')
+                  need(type(rows) is list and type(paging) is dict and type(paging.get('total')) is int and type(paging.get('offset')) is int, 'invalid_status_paging')
+                  count=paging['total'];need(0<=count<=max_rows and paging['offset']==offset and offset<=count and len(rows)<=count-offset,'invalid_status_paging')
+                  need(total is None or count==total,'status_index_changed');total=count
+                  for row in rows:
+                      need(type(row) is dict,'invalid_status_row')
+                      rid=ident(row.get('id'));need(rid not in seen,'duplicate_status_row');seen.add(rid);all_rows.append(row)
+                  offset+=len(rows)
+                  if offset==count:return all_rows
+                  need(bool(rows),'incomplete_status_page')
+              raise Stop('status_search_bound')
+          
+          def amount_is(value,expected):
+              try:v=Decimal(str(value))
+              except InvalidOperation:return False
+              return v.is_finite() and v==expected
+          
+          def observe(client):
+              sid=seller(client)
+              plan=client.call('GET','/preapproval_plan/'+PLAN_ID)
+              owned_plan(plan,sid,reason_for(PLAN_RUN),PLAN_ID)
+              plan_link(plan,PLAN_ID)
+              rows=list_rows(client,'/preapproval/search',{'preapproval_plan_id':PLAN_ID,'limit':100})
+              summaries=[]
+              payment_ids=set()
+              for candidate in rows:
+                  rid=ident(candidate.get('id'))
+                  sub=client.call('GET','/preapproval/'+rid)
+                  need(ident(sub.get('id'))==rid and ident(sub.get('collector_id'))==sid and sub.get('preapproval_plan_id')==PLAN_ID, 'subscription_plan_owner_mismatch')
+                  status=sub.get('status');need(status in ('pending','authorized','paused','cancelled','canceled'),'unknown_subscription_status')
+                  try:expected_buyer=ident(sub.get('payer_id'))==BUYER_ID
+                  except Stop:expected_buyer=False
+                  # No account-by-email matching; optional email never printed/persisted.
+                  summary={'status':status,'expected_test_buyer':expected_buyer,'payer_email_present':type(sub.get('payer_email')) is str and bool(sub.get('payer_email')),'invoices':0,'approved_payments_verified':0}
+                  if not expected_buyer:
+                      summaries.append(summary);continue
+                  invoices=list_rows(client,'/authorized_payments/search',{'preapproval_id':rid},max_rows=100)
+                  summary['invoices']=len(invoices);payment_states=[]
+                  for invoice in invoices:
+                      need(invoice.get('preapproval_id')==rid,'invoice_subscription_mismatch')
+                      payment=invoice.get('payment')
+                      if type(payment) is not dict or not payment.get('id'):continue
+                      pid=ident(payment['id']);need(pid not in payment_ids,'duplicate_invoice_payment');payment_ids.add(pid)
+                      actual=client.call('GET','/v1/payments/'+pid)
+                      need(ident(actual.get('id'))==pid and ident(actual.get('collector_id'))==sid and type(actual.get('payer')) is dict and ident(actual['payer'].get('id'))==BUYER_ID,'payment_owner_buyer_mismatch')
+                      ps=actual.get('status');need(ps in ('approved','pending','in_process','rejected','cancelled','refunded','charged_back','authorized','in_mediation'),'unknown_payment_status')
+                      payment_states.append(ps)
+                      if ps=='approved' and payment.get('status')=='approved' and actual.get('currency_id')=='BRL' and amount_is(actual.get('transaction_amount'),Decimal('9.90')) and amount_is(actual.get('transaction_amount_refunded'),Decimal('0')):
+                          summary['approved_payments_verified']+=1
+                  summary['payment_statuses']=payment_states
+                  summaries.append(summary)
+              return {'test_plan_verified':True,'subscriptions_count':len(summaries),'subscriptions':summaries,'application_access_verified':False,'production_changed':False,'api_writes':0}
+          
+          def main():
+              need(os.environ.get('RM2_PLAN_STATUS_READ_APPROVED')=='yes','read_not_approved')
+              result=observe(Client(os.environ.get('MP_ACCESS_TOKEN','')))
+              print(json.dumps(result))
+          
+          if __name__=='__main__':
+              try:main()
+              except HTTPFailure as exc:
+                  print(json.dumps({'ok':False,'code':str(exc),'diagnostic':exc.detail}));sys.exit(1)
+              except Stop as exc:
+                  print(json.dumps({'ok':False,'code':str(exc)}));sys.exit(1)
+              except BaseException:
+                  print(json.dumps({'ok':False,'code':'unexpected_status_read_failure'}));sys.exit(1)
+          PYCODE
