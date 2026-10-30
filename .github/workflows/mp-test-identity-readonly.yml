@@ -1,15 +1,12 @@
 name: Mercado Pago read-only test identity
 
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/mp-test-identity-readonly.yml']
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   classify-test-identity:
-    if: github.event.head_commit.message == 'Verify sandbox identity once 20261030T1100'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
