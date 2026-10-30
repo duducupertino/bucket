@@ -1,12 +1,10 @@
 name: Official synthetic standalone payment
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/mp-sandbox-payment-smoke.yml']
+  workflow_dispatch:
 permissions: {}
 jobs:
   single-synthetic-payment:
-    if: github.event.head_commit.message == 'Run official synthetic payment once 20261030T1340'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
