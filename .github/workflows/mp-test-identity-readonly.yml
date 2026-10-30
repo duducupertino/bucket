@@ -1,0 +1,87 @@
+name: Mercado Pago read-only test identity
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mp-test-identity-readonly.yml']
+
+permissions: {}
+
+jobs:
+  classify-test-identity:
+    if: github.event.head_commit.message == 'Verify sandbox identity once 20261030T1100'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Read own identity once without exposing account data
+        env:
+          MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          """Read-only identity classification. No payment, token creation or account change.
+          Only booleans/status reach logs; provider body and identifiers stay in memory.
+          """
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          
+          
+          def stop(label):
+              print('result=' + label)
+              raise SystemExit(1)
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          
+          def main():
+              token = os.environ.get('MP_ACCESS_TOKEN', '')
+              print('secret_present=' + str(bool(token)).lower())
+              if not token or not token.isascii() or '\r' in token or '\n' in token:
+                  stop('credential_unusable')
+              # Fixed HTTPS endpoint. No arbitrary URLs, query, redirects, alternate hosts.
+              request = urllib.request.Request('https://api.mercadopago.com/users/me', method='GET',
+                  headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'})
+              try:
+                  response = urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
+              except urllib.error.HTTPError as error:
+                  response = error
+              except Exception:
+                  stop('transport_failure_no_retry')
+              try:
+                  with response:
+                      status = response.status
+                      body = response.read(1024 * 1024 + 1)
+                  print('http_status=' + str(status))
+                  if status != 200 or len(body) > 1024 * 1024:
+                      stop('http_or_size_failure_no_retry')
+                  data = json.loads(body)
+              except (ValueError, UnicodeError, OSError):
+                  stop('response_unreadable_no_retry')
+              if not isinstance(data, dict):
+                  stop('response_not_object')
+              tags = data.get('tags')
+              tags_valid = isinstance(tags, list) and all(isinstance(t, str) for t in tags)
+              site_valid = isinstance(data.get('site_id'), str)
+              print('tags_schema_valid=' + str(tags_valid).lower())
+              print('site_schema_valid=' + str(site_valid).lower())
+              if not tags_valid or not site_valid:
+                  stop('identity_classification_unknown')
+              is_test = 'test_user' in tags
+              is_brazil = data['site_id'] == 'MLB'
+              print('test_user_confirmed=' + str(is_test).lower())
+              print('site_mlb_confirmed=' + str(is_brazil).lower())
+              print('mutations_performed=false')
+              if not is_test or not is_brazil:
+                  stop('brazil_test_identity_not_confirmed')
+              print('result=brazil_test_identity_confirmed')
+          
+          
+          if __name__ == '__main__':
+              main()
+          PYCODE
