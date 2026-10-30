@@ -1,30 +1,27 @@
-name: Mercado Pago pending identifier experiment
+name: Recover pending probe 41060848926 once
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/mp-pending-identifier-experiment.yml']
 permissions: {}
 concurrency:
   group: rm2-sandbox-pending-identifier
   cancel-in-progress: false
 jobs:
-  pending-experiment:
-    if: github.event.head_commit.message == 'Run pending identifier probe once 20261030T1306'
+  recover:
+    if: github.event.head_commit.message == 'Recover pending probe 41060848926 once'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Pending test identifier and cleanup without payment
+      - name: Recover original TEST pending only; never create
         env:
           MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
           MP_TEST_BUYER_JSON: '{"identifier":"TESTUSER7604974922275426030","id":3805193692}'
-          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-pending-private-journal.json
-          RM2_PROBE_MODE: create
+          RM2_PROBE_MODE: recover
+          RM2_ORIGINAL_RUN_ID: '41060848926'
           RM2_PENDING_EXECUTION_APPROVED: 'yes'
           RM2_WEBHOOK_ROUTING_REVIEWED: 'yes'
           RM2_RECOVERY_PLAN_REVIEWED: 'yes'
-          RM2_ISOLATED_BACK_URL: https://example.com/futurorm2-sandbox-return
-          RM2_ISOLATED_CALLBACK_HOST: example.com
-        shell: bash
+          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-recover-original-private.json
         run: |
           python3 - <<'PYCODE'
           """Explicitly gated pending-only TEST experiment. Never prints provider bodies."""
@@ -42,6 +39,80 @@ jobs:
           
           class Stop(Exception):
               pass
+          
+          class HTTPFailure(Stop):
+              def __init__(self, status, detail):
+                  super().__init__('http_' + str(status))
+                  self.detail = detail
+          
+          def safe_http_detail(raw, method, path, secrets):
+              route = path.split('?')[0]
+              if route.startswith('/preapproval/') and route != '/preapproval/search':
+                  route = '/preapproval/{id}'
+              detail = {'method':method, 'route':route}
+              def scrub(value):
+                  if type(value) not in (str, int):
+                      return None
+                  value = str(value)[:4000]
+                  for secret in secrets:
+                      if secret:
+                          value = value.replace(str(secret), '[redacted]')
+                  value = re.sub(r'(?i)https?://[^\s\"<>]+', '[url]', value)
+                  value = re.sub(r"[^\s\"<>]+@[A-Za-z0-9.-]+", '[email]', value)
+                  value = re.sub(r'(?i)\b(?:APP_USR|TESTUSER|TEST-)[A-Za-z0-9_-]*', '[redacted]', value)
+                  value = re.sub(r'\b[0-9]{6,}\b', '[id]', value)
+                  value = re.sub(r'(?i)\b[0-9a-f]{24,}\b', '[opaque_id]', value)
+                  value = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b', '[reference]', value)
+                  return ''.join(c for c in value if c.isprintable())[:500]
+              try:
+                  data = json.loads(raw)
+              except Exception:
+                  detail['category'] = 'non_json_error_response'
+                  return detail
+              if type(data) is not dict:
+                  detail['category'] = 'non_object_error_response'
+                  return detail
+              detail['category'] = 'provider_error'
+              known_messages = {
+                  'Invalid payer_email', 'Invalid value for payer_email',
+                  'payer_email must be a valid email', 'The payer_email must be a valid email',
+                  'Invalid email', 'Invalid email address',
+                  'Unauthorized use of live credentials', 'Invalid credentials',
+                  'Invalid access token', 'Invalid back_url', 'Invalid value for back_url',
+                  'The payer and collector cannot be the same',
+                  'Cannot operate between different countries',
+              }
+              message = data.get('message')
+              if type(message) is str:
+                  known = {v.casefold():v for v in known_messages}
+                  if message.strip().casefold() in known:
+                      detail['message'] = known[message.strip().casefold()]
+                  else:
+                      lower = message.casefold()
+                      detail['message_category'] = 'unrecognized_provider_message_not_logged'
+                      detail['mentioned_fields'] = [v for v in ('payer_email','payer_id','back_url','auto_recurring','external_reference','access_token','status','currency_id','transaction_amount') if v in lower]
+                      detail['reason_signals'] = [v for v in ('invalid','required','unauthorized','forbidden','not found','not allowed','email','credentials') if v in lower]
+              error = data.get('error')
+              known_errors = {'bad_request','unauthorized','forbidden','not_found','invalid_request','invalid_token','invalid_grant','invalid_payer_email','validation_error'}
+              if type(error) is str and error in known_errors:
+                  detail['error'] = error
+              elif error is not None:
+                  detail['error_category'] = 'unrecognized_code_not_logged'
+              causes = data.get('cause')
+              if type(causes) is list:
+                  codes=[]
+                  for cause in causes[:10]:
+                      if type(cause) is not dict:
+                          continue
+                      code=cause.get('code')
+                      if type(code) in (str,int) and re.fullmatch(r'[0-9]{1,5}',str(code)):
+                          codes.append(str(code))
+                      elif type(code) is str and code in known_errors:
+                          codes.append(code)
+                      else:
+                          codes.append('unknown_code_not_logged')
+                  detail['cause_codes']=codes
+              return detail
           
           def need(ok, code):
               if not ok:
@@ -76,6 +147,12 @@ jobs:
               def __init__(self, token):
                   need(type(token) is str and len(token) > 10 and '\n' not in token and '\r' not in token, 'missing_token')
                   self.token = token
+                  self.sensitive = [token]
+                  try:
+                      buyer = json.loads(os.environ.get('MP_TEST_BUYER_JSON','{}'))
+                      self.sensitive.extend(str(buyer.get(k,'')) for k in ('identifier','id'))
+                  except Exception:
+                      pass
                   self.opener = build_opener(NoRedirect())
               def call(self, method, path, body=None, key=None):
                   parts = urlsplit(path)
@@ -95,7 +172,18 @@ jobs:
                           raw = res.read(1_000_001)
                           need(len(raw) <= 1_000_000, 'response_too_large')
                   except HTTPError as exc:
-                      raise Stop('http_' + str(exc.code)) from None
+                      try:
+                          raw = exc.read(16384)
+                      except Exception:
+                          raw = b''
+                      sensitive = list(self.sensitive)
+                      if resource:
+                          sensitive.append(parts.path.rsplit('/',1)[-1])
+                      if type(body) is dict:
+                          sensitive.extend(str(body.get(k,'')) for k in ('external_reference','payer_email'))
+                      if key:
+                          sensitive.append(key)
+                      raise HTTPFailure(exc.code, safe_http_detail(raw,method,path,sensitive)) from None
                   except Stop:
                       raise
                   except Exception:
@@ -110,7 +198,10 @@ jobs:
           def seller(client):
               me = client.call('GET','/users/me')
               need(me.get('site_id') == 'MLB' and type(me.get('tags')) is list and all(type(t) is str for t in me['tags']) and 'test_user' in me['tags'], 'seller_not_verified_test_mlb')
-              return ident(me.get('id'))
+              sid = ident(me.get('id'))
+              if type(getattr(client, "sensitive", None)) is list:
+                  client.sensitive.append(sid)
+              return sid
           
           def callback(url, expected_host):
               p = urlsplit(url)
@@ -272,6 +363,8 @@ jobs:
           if __name__=='__main__':
               try:
                   main()
+              except HTTPFailure as exc:
+                  print(json.dumps({'ok':False,'code':str(exc),'diagnostic':exc.detail})); sys.exit(1)
               except Stop as exc:
                   print(json.dumps({'ok':False,'code':str(exc)})); sys.exit(1)
               except BaseException:
