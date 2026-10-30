@@ -1,4 +1,4 @@
-name: Recover pending probe 41060848926 once
+name: Diagnose rejected pending request 41060848926 once
 on:
   push:
     branches: [main]
@@ -7,21 +7,23 @@ concurrency:
   group: rm2-sandbox-pending-identifier
   cancel-in-progress: false
 jobs:
-  recover:
-    if: github.event.head_commit.message == 'Recover pending probe 41060848926 once'
+  diagnose:
+    if: github.event.head_commit.message == 'Diagnose rejected pending request 41060848926 once'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Recover original TEST pending only; never create
+      - name: One diagnostic repeat of rejected TEST pending; same original reference
         env:
           MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
           MP_TEST_BUYER_JSON: '{"identifier":"TESTUSER7604974922275426030","id":3805193692}'
-          RM2_PROBE_MODE: recover
+          RM2_PROBE_MODE: diagnose_rejected_once
           RM2_ORIGINAL_RUN_ID: '41060848926'
           RM2_PENDING_EXECUTION_APPROVED: 'yes'
           RM2_WEBHOOK_ROUTING_REVIEWED: 'yes'
           RM2_RECOVERY_PLAN_REVIEWED: 'yes'
-          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-recover-original-private.json
+          RM2_ISOLATED_BACK_URL: https://example.com/futurorm2-sandbox-return
+          RM2_ISOLATED_CALLBACK_HOST: example.com
+          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-diagnose-original-private.json
         run: |
           python3 - <<'PYCODE'
           """Explicitly gated pending-only TEST experiment. Never prints provider bodies."""
@@ -345,15 +347,17 @@ jobs:
               need(os.environ.get('RM2_WEBHOOK_ROUTING_REVIEWED')=='yes', 'routing_not_reviewed')
               identifier,bid = buyer_config(os.environ.get('MP_TEST_BUYER_JSON',''))
               mode = os.environ.get('RM2_PROBE_MODE','')
-              need(mode in ('create','recover'), 'invalid_mode')
+              need(mode in ('create','recover','diagnose_rejected_once'), 'invalid_mode')
               run = os.environ.get('GITHUB_RUN_ID','') if mode=='create' else os.environ.get('RM2_ORIGINAL_RUN_ID','')
+              if mode == 'diagnose_rejected_once':
+                  need(run == '41060848926', 'diagnostic_original_run_mismatch')
               ref_for(run)
-              if mode=='create':
+              if mode in ('create','diagnose_rejected_once'):
                   need(os.environ.get('GITHUB_RUN_ATTEMPT')=='1', 'rerun_refused_use_recovery')
                   need(os.environ.get('RM2_RECOVERY_PLAN_REVIEWED')=='yes', 'recovery_not_reviewed')
               client = Client(os.environ.get('MP_ACCESS_TOKEN',''))
               journal = Journal(os.environ.get('RM2_PRIVATE_JOURNAL',''))
-              if mode=='create':
+              if mode in ('create','diagnose_rejected_once'):
                   back = callback(os.environ.get('RM2_ISOLATED_BACK_URL',''), os.environ.get('RM2_ISOLATED_CALLBACK_HOST',''))
                   result = create(client,run,identifier,bid,back,journal)
               else:
