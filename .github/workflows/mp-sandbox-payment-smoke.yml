@@ -1,0 +1,150 @@
+name: Mercado Pago standalone sandbox payment smoke
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mp-sandbox-payment-smoke.yml']
+
+permissions: {}
+
+concurrency:
+  group: mp-standalone-sandbox-smoke
+  cancel-in-progress: false
+
+jobs:
+  standalone-sandbox-payment:
+    if: github.event.head_commit.message == 'Run single synthetic payment 20261030T1056'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: One synthetic standalone payment (not subscription)
+        env:
+          MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
+          MP_TEST_ORIGIN_CONFIRMED: 'true'
+          MP_EXECUTE_SANDBOX_PAYMENT: 'true'
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          """REVIEW ONLY. Synthetic standalone payment, NOT subscription/end-to-end QA.
+          No user-supplied card data accepted. No source/customer data, no response storage.
+          Required environment: MP_ACCESS_TOKEN (existing secret), MP_TEST_ORIGIN_CONFIRMED=true,
+          MP_EXECUTE_SANDBOX_PAYMENT=true. Do not run before review/authorization.
+          """
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+          import uuid
+          
+          BASE = 'https://api.mercadopago.com'
+          MAX_BYTES = 1024 * 1024
+          # Stable across reruns: never create a second payment by silently changing key.
+          IDEMPOTENCY_KEY = None  # Derived from GitHub run ID only after validation.
+          
+          
+          def stop(reason):
+              print('result=' + reason)
+              raise SystemExit(1)
+          
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          
+          def main():
+              token = os.environ.get('MP_ACCESS_TOKEN', '')
+              payer = 'test_payer@example.com'  # Official Payments API synthetic example, not an account.
+              if os.environ.get('MP_EXECUTE_SANDBOX_PAYMENT') != 'true':
+                  stop('execution_not_enabled')
+              if os.environ.get('MP_TEST_ORIGIN_CONFIRMED') != 'true':
+                  stop('test_origin_not_confirmed')
+              # Conservative scope: this proposal does not support APP_USR test accounts.
+              # Prefix is only an additional guard, never sufficient proof of sandbox.
+              if not token.startswith('TEST-') or '\r' in token or '\n' in token:
+                  stop('credential_scope_not_supported')
+              run_id = os.environ.get('GITHUB_RUN_ID', '')
+              if not re.fullmatch(r'[0-9]+', run_id):
+                  stop('github_run_id_required')
+              idempotency_key = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                  'https://github.com/duducupertino/bucket/actions/runs/' + run_id + '/single-sandbox-payment'))
+              reference = 'sandbox-smoke-' + run_id
+              opener = urllib.request.build_opener(NoRedirect())
+          
+              def api(stage, method, path, payload=None):
+                  allowed = ((method == 'POST' and path in ('/v1/card_tokens', '/v1/payments'))
+                             or (method == 'GET' and re.fullmatch(r'/v1/payments/[0-9]+', path)))
+                  if not allowed:
+                      stop('endpoint_not_allowed')
+                  headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}
+                  data = None
+                  if payload is not None:
+                      headers['Content-Type'] = 'application/json'
+                      data = json.dumps(payload).encode()
+                  if path == '/v1/payments' and method == 'POST':
+                      headers['X-Idempotency-Key'] = idempotency_key
+                  request = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+                  try:
+                      response = opener.open(request, timeout=30)
+                  except urllib.error.HTTPError as error:
+                      response = error
+                  except Exception:
+                      stop(stage + '_transport_error_no_retry')
+                  try:
+                      with response:
+                          status = response.status
+                          body = response.read(MAX_BYTES + 1)
+                      print(stage + '_http_status=' + str(status))
+                      if status not in (200, 201) or len(body) > MAX_BYTES:
+                          stop(stage + '_http_or_size_failure_no_retry')
+                      result = json.loads(body)
+                      if not isinstance(result, dict):
+                          stop(stage + '_invalid_response')
+                      return result
+                  except (ValueError, UnicodeError, OSError):
+                      stop(stage + '_unreadable_response_no_retry')
+          
+              # Public official test fixture, never actual cardholder/card data.
+              card = api('tokenization', 'POST', '/v1/card_tokens', {
+                  'card_number': '5480832801033311', 'security_code': '123',
+                  'expiration_month': 11, 'expiration_year': 2030,
+                  'cardholder': {'name': 'APRO', 'identification': {
+                      'type': 'CPF', 'number': '12345678909'}}})
+              if card.get('live_mode') is not False:
+                  stop('tokenization_sandbox_not_confirmed_payment_not_sent')
+              if card.get('status') != 'active' or not isinstance(card.get('id'), str) or not card['id']:
+                  stop('card_token_invalid_payment_not_sent')
+              print('tokenization_sandbox_confirmed=true')
+              payment = api('payment', 'POST', '/v1/payments', {
+                  'token': card['id'], 'transaction_amount': 9.90, 'installments': 1,
+                  'payment_method_id': 'master', 'description': 'Synthetic sandbox connectivity payment',
+                  'external_reference': reference,
+                  'payer': {'email': payer, 'identification': {'type': 'CPF', 'number': '12345678909'}}})
+              if payment.get('live_mode') is not False:
+                  stop('payment_sandbox_not_confirmed_stop_all_actions')
+              if payment.get('status') != 'approved':
+                  print('payment_approved=false')
+                  stop('payment_not_approved_no_retry')
+              payment_id = str(payment.get('id', ''))
+              if not re.fullmatch(r'[0-9]+', payment_id):
+                  stop('payment_identifier_invalid')
+              verified = api('verification', 'GET', '/v1/payments/' + payment_id)
+              if (str(verified.get('id')) != payment_id or verified.get('live_mode') is not False
+                      or verified.get('external_reference') != reference
+                      or verified.get('currency_id') != 'BRL'
+                      or verified.get('transaction_amount') != 9.9):
+                  stop('payment_readback_mismatch')
+              print('payment_sandbox_confirmed=true')
+              print('test_amount_brl=9.90')
+              approved = verified.get('status') == 'approved'
+              print('payment_approved=' + str(approved).lower())
+              print('subscription_tested=false')
+              if not approved:
+                  stop('payment_not_approved_no_retry')
+          
+          
+          if __name__ == '__main__':
+              main()
+          PYCODE
