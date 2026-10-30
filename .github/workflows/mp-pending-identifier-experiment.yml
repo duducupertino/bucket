@@ -1,7 +1,6 @@
 name: Probe pending without payer identity once
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 permissions: {}
 concurrency:
   group: rm2-sandbox-pending-identifier
