@@ -1,39 +1,31 @@
-name: Mercado Pago tokenization diagnostic without payment
-
+name: Inspect synthetic buyer fields read-only
 on:
-  workflow_dispatch:
-
+  push:
+    branches: [main]
+    paths: ['.github/workflows/mp-sandbox-payment-smoke.yml']
 permissions: {}
-
-concurrency:
-  group: mp-standalone-sandbox-smoke
-  cancel-in-progress: false
-
 jobs:
-  standalone-sandbox-payment:
+  inspect-synthetic-buyer:
+    if: github.event.head_commit.message == 'Inspect synthetic buyer fields once 20261030T1325'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Inspect synthetic token mode; no financial endpoints
+      - name: Read known synthetic buyer once
         env:
           MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
-          MP_TEST_ORIGIN_CONFIRMED: 'true'
-          MP_EXECUTE_TOKENIZATION_DIAGNOSTIC: 'true'
         shell: bash
         run: |
           python3 - <<'PYCODE'
-          """REVIEW ONLY. Synthetic tokenization diagnostics; financial requests prohibited.
-          No user-supplied card data accepted. No source/customer data, no response storage.
-          Required environment: MP_ACCESS_TOKEN (existing secret), MP_TEST_ORIGIN_CONFIRMED=true,
-          MP_EXECUTE_TOKENIZATION_DIAGNOSTIC=true. Do not run before review/authorization.
+          """Single read-only compatibility probe; endpoint not officially confirmed.
+          No fallback, no impersonation, no mutation. Buyer ID is a public synthetic fixture.
           """
           import json
           import os
+          import re
           import urllib.error
           import urllib.request
           
-          BASE = 'https://api.mercadopago.com'
-          MAX_BYTES = 1024 * 1024
+          BUYER_ID = '3805193692'
           
           
           def stop(reason):
@@ -48,65 +40,48 @@ jobs:
           
           def main():
               token = os.environ.get('MP_ACCESS_TOKEN', '')
-              if os.environ.get('MP_EXECUTE_TOKENIZATION_DIAGNOSTIC') != 'true':
-                  stop('execution_not_enabled')
-              if os.environ.get('MP_TEST_ORIGIN_CONFIRMED') != 'true':
-                  stop('test_origin_not_confirmed')
-              # Identity is verified with this exact credential in this same run.
               if not token or not token.isascii() or '\r' in token or '\n' in token:
                   stop('credential_unusable')
-              opener = urllib.request.build_opener(NoRedirect())
-          
-              def api(stage, method, path, payload=None):
-                  allowed = (method, path) in {('GET', '/users/me'), ('POST', '/v1/card_tokens')}
-                  if not allowed:
-                      stop('endpoint_not_allowed')
-                  headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}
-                  data = None
-                  if payload is not None:
-                      headers['Content-Type'] = 'application/json'
-                      data = json.dumps(payload).encode()
-                  request = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
-                  try:
-                      response = opener.open(request, timeout=30)
-                  except urllib.error.HTTPError as error:
-                      response = error
-                  except Exception:
-                      stop(stage + '_transport_error_no_retry')
-                  try:
-                      with response:
-                          status = response.status
-                          body = response.read(MAX_BYTES + 1)
-                      print(stage + '_http_status=' + str(status))
-                      if status not in ((200,) if method == 'GET' else (200, 201)) or len(body) > MAX_BYTES:
-                          stop(stage + '_http_or_size_failure_no_retry')
-                      result = json.loads(body)
-                      if not isinstance(result, dict):
-                          stop(stage + '_invalid_response')
-                      return result
-                  except (ValueError, UnicodeError, OSError):
-                      stop(stage + '_unreadable_response_no_retry')
-          
-              identity = api('identity', 'GET', '/users/me')
-              tags = identity.get('tags')
-              if (not isinstance(tags, list) or not all(isinstance(t, str) for t in tags)
-                      or 'test_user' not in tags or identity.get('site_id') != 'MLB'):
-                  stop('brazil_test_identity_not_confirmed_no_post')
-              print('brazil_test_identity_confirmed=true')
-          
-              # Public official test fixture, never actual cardholder/card data.
-              card = api('tokenization', 'POST', '/v1/card_tokens', {
-                  'card_number': '5480832801033311', 'security_code': '123',
-                  'expiration_month': 11, 'expiration_year': 2030,
-                  'cardholder': {'name': 'APRO', 'identification': {
-                      'type': 'CPF', 'number': '12345678909'}}})
-              print('live_mode_present=' + str('live_mode' in card).lower())
-              print('live_mode_is_false=' + str(card.get('live_mode') is False).lower())
-              print('live_mode_is_true=' + str(card.get('live_mode') is True).lower())
-              print('live_mode_type_valid=' + str(type(card.get('live_mode')) is bool).lower())
-              print('status_active=' + str(card.get('status') == 'active').lower())
-              print('financial_requests_performed=false')
-              print('result=tokenization_diagnostic_complete_no_payment')
+              req = urllib.request.Request('https://api.mercadopago.com/users/' + BUYER_ID,
+                  method='GET', headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'})
+              try:
+                  response = urllib.request.build_opener(NoRedirect()).open(req, timeout=30)
+              except urllib.error.HTTPError as error:
+                  response = error
+              except Exception:
+                  stop('transport_failure_no_retry')
+              try:
+                  with response:
+                      status = response.status
+                      body = response.read(1024 * 1024 + 1)
+                  print('http_status=' + str(status))
+                  if status != 200 or len(body) > 1024 * 1024:
+                      stop('http_or_size_failure_no_retry')
+                  data = json.loads(body)
+              except (ValueError, UnicodeError, OSError):
+                  stop('response_unreadable_no_retry')
+              if not isinstance(data, dict):
+                  stop('response_not_object')
+              identifier = data.get('id')
+              id_match = type(identifier) in (int, str) and str(identifier) == BUYER_ID
+              tags = data.get('tags')
+              tags_valid = isinstance(tags, list) and all(isinstance(t, str) for t in tags)
+              is_test = tags_valid and 'test_user' in tags
+              is_brazil = data.get('site_id') == 'MLB'
+              email = data.get('email')
+              email_valid = (isinstance(email, str) and len(email) <= 254
+                  and re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email) is not None)
+              print('known_buyer_id_match=' + str(id_match).lower())
+              print('tags_schema_valid=' + str(tags_valid).lower())
+              print('test_user_confirmed=' + str(is_test).lower())
+              print('site_mlb_confirmed=' + str(is_brazil).lower())
+              print('has_email_field=' + str('email' in data).lower())
+              print('email_type_string=' + str(isinstance(email, str)).lower())
+              print('email_syntax_valid=' + str(email_valid).lower())
+              print('mutations_performed=false')
+              if not id_match or not is_test or not is_brazil:
+                  stop('known_brazil_test_buyer_not_confirmed')
+              print('result=known_test_buyer_readonly_classification_complete')
           
           
           if __name__ == '__main__':
