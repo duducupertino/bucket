@@ -1,12 +1,10 @@
 name: Inspect synthetic buyer fields read-only
 on:
-  push:
-    branches: [main]
-    paths: ['.github/workflows/mp-sandbox-payment-smoke.yml']
+  workflow_dispatch:
 permissions: {}
 jobs:
   inspect-synthetic-buyer:
-    if: github.event.head_commit.message == 'Inspect synthetic buyer fields once 20261030T1325'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
