@@ -1,14 +1,13 @@
 name: Create one TEST subscription plan for hosted checkout
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 permissions: {}
 concurrency:
   group: rm2-sandbox-pending-identifier
   cancel-in-progress: false
 jobs:
   probe:
-    if: github.event.head_commit.message == 'Create one TEST subscription plan for hosted checkout'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
