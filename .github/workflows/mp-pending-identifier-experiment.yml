@@ -1,4 +1,4 @@
-name: Diagnose rejected pending request 41060848926 once
+name: Probe pending without payer identity once
 on:
   push:
     branches: [main]
@@ -7,23 +7,21 @@ concurrency:
   group: rm2-sandbox-pending-identifier
   cancel-in-progress: false
 jobs:
-  diagnose:
-    if: ${{ false }}
+  probe:
+    if: github.event.head_commit.message == 'Probe pending without payer identity once'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: One diagnostic repeat of rejected TEST pending; same original reference
+      - name: One pending-only TEST variant without payer identity
         env:
           MP_ACCESS_TOKEN: ${{ secrets.MERCADOPAGO_ACCESS_TOKEN_ASSINATURA_DEV }}
-          MP_TEST_BUYER_JSON: '{"identifier":"TESTUSER7604974922275426030","id":3805193692}'
-          RM2_PROBE_MODE: diagnose_rejected_once
-          RM2_ORIGINAL_RUN_ID: '41060848926'
+          RM2_PROBE_MODE: create
           RM2_PENDING_EXECUTION_APPROVED: 'yes'
           RM2_WEBHOOK_ROUTING_REVIEWED: 'yes'
           RM2_RECOVERY_PLAN_REVIEWED: 'yes'
           RM2_ISOLATED_BACK_URL: https://example.com/futurorm2-sandbox-return
           RM2_ISOLATED_CALLBACK_HOST: example.com
-          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-diagnose-original-private.json
+          RM2_PRIVATE_JOURNAL: ${{ runner.temp }}/rm2-no-payer-private.json
         run: |
           python3 - <<'PYCODE'
           """Explicitly gated pending-only TEST experiment. Never prints provider bodies."""
@@ -77,6 +75,8 @@ jobs:
               detail['category'] = 'provider_error'
               known_messages = {
                   'Invalid payer_email', 'Invalid value for payer_email',
+                  'payer_email is required', 'payer_email is missing',
+                  'Missing required parameter payer_email', 'The payer_email field is required',
                   'payer_email must be a valid email', 'The payer_email must be a valid email',
                   'Invalid email', 'Invalid email address',
                   'Unauthorized use of live credentials', 'Invalid credentials',
@@ -93,7 +93,7 @@ jobs:
                       lower = message.casefold()
                       detail['message_category'] = 'unrecognized_provider_message_not_logged'
                       detail['mentioned_fields'] = [v for v in ('payer_email','payer_id','back_url','auto_recurring','external_reference','access_token','status','currency_id','transaction_amount') if v in lower]
-                      detail['reason_signals'] = [v for v in ('invalid','required','unauthorized','forbidden','not found','not allowed','email','credentials') if v in lower]
+                      detail['reason_signals'] = [v for v in ('invalid','required','missing','unauthorized','forbidden','not found','not allowed','email','credentials') if v in lower]
               error = data.get('error')
               known_errors = {'bad_request','unauthorized','forbidden','not_found','invalid_request','invalid_token','invalid_grant','invalid_payer_email','validation_error'}
               if type(error) is str and error in known_errors:
@@ -217,7 +217,8 @@ jobs:
               need(type(row) is dict and ident(row.get('id')) == rid and ident(row.get('collector_id')) == sid and row.get('external_reference') == ref, 'ownership_or_reference_mismatch')
           
           def offer(row, rid, bid):
-              need(ident(row.get('payer_id')) == bid, 'resolved_buyer_mismatch')
+              if bid is not None:
+                  need(ident(row.get('payer_id')) == bid, 'resolved_buyer_mismatch')
               need(row.get('status') == 'pending', 'not_pending')
               rec = row.get('auto_recurring')
               need(type(rec) is dict and type(rec.get('frequency')) is int and rec['frequency']==1 and rec.get('frequency_type')=='months' and rec.get('currency_id')=='BRL', 'offer_mismatch')
@@ -274,7 +275,7 @@ jobs:
               ref = ref_for(run)
               sid = seller(client)
               need(sid != bid, 'same_buyer_seller')
-              body = {'status':'pending', 'reason':'FuturoRM2 — concurso RM2 da Marinha', 'external_reference':ref, 'payer_email':identifier, 'auto_recurring':{'frequency':1,'frequency_type':'months','transaction_amount':9.9,'currency_id':'BRL'}, 'back_url':back_url}
+              body = {'status':'pending', 'reason':'FuturoRM2 — concurso RM2 da Marinha', 'external_reference':ref, 'auto_recurring':{'frequency':1,'frequency_type':'months','transaction_amount':9.9,'currency_id':'BRL'}, 'back_url':back_url}
               journal.write(phase='creation_outcome_pending', original_run=run, reference=ref)
               response = client.call('POST','/preapproval',body,ref)
               rid = ident(response.get('id'))
@@ -289,7 +290,7 @@ jobs:
               clean(client,row,sid,ref,rid,journal)
               if failure:
                   raise Stop(failure+'_cleaned')
-              return {'pending_identifier_resolved':True, 'read_verified':True, 'cancelled_verified':True, 'payment_attempted':False, 'hosted_checkout_opened':False}
+              return {'pending_without_payer_email_accepted':True, 'payer_id_present':row.get('payer_id') is not None, 'read_verified':True, 'cancelled_verified':True, 'payment_attempted':False, 'hosted_checkout_opened':False}
           
           def search_reference(client, ref, bid=None):
               matches = {}
@@ -334,7 +335,7 @@ jobs:
               row = client.call('GET','/preapproval/'+rid)
               owned(row,sid,ref,rid)
               try:
-                  payer_matches = ident(row.get('payer_id')) == bid
+                  payer_matches = bid is None or ident(row.get('payer_id')) == bid
               except Stop:
                   payer_matches = False
               clean(client,row,sid,ref,rid,journal)
@@ -345,19 +346,17 @@ jobs:
           def main():
               need(os.environ.get('RM2_PENDING_EXECUTION_APPROVED')=='yes', 'execution_not_approved')
               need(os.environ.get('RM2_WEBHOOK_ROUTING_REVIEWED')=='yes', 'routing_not_reviewed')
-              identifier,bid = buyer_config(os.environ.get('MP_TEST_BUYER_JSON',''))
+              identifier,bid = None,None  # Explicit TEST variant: omit payer identity entirely.
               mode = os.environ.get('RM2_PROBE_MODE','')
-              need(mode in ('create','recover','diagnose_rejected_once'), 'invalid_mode')
+              need(mode in ('create','recover'), 'invalid_mode')
               run = os.environ.get('GITHUB_RUN_ID','') if mode=='create' else os.environ.get('RM2_ORIGINAL_RUN_ID','')
-              if mode == 'diagnose_rejected_once':
-                  need(run == '41060848926', 'diagnostic_original_run_mismatch')
               ref_for(run)
-              if mode in ('create','diagnose_rejected_once'):
+              if mode=='create':
                   need(os.environ.get('GITHUB_RUN_ATTEMPT')=='1', 'rerun_refused_use_recovery')
                   need(os.environ.get('RM2_RECOVERY_PLAN_REVIEWED')=='yes', 'recovery_not_reviewed')
               client = Client(os.environ.get('MP_ACCESS_TOKEN',''))
               journal = Journal(os.environ.get('RM2_PRIVATE_JOURNAL',''))
-              if mode in ('create','diagnose_rejected_once'):
+              if mode=='create':
                   back = callback(os.environ.get('RM2_ISOLATED_BACK_URL',''), os.environ.get('RM2_ISOLATED_CALLBACK_HOST',''))
                   result = create(client,run,identifier,bid,back,journal)
               else:
